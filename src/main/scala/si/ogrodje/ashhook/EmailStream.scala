@@ -4,9 +4,11 @@ import eu.timepit.refined.auto.autoUnwrap
 import jakarta.mail.event.{MessageCountEvent, MessageCountListener}
 import jakarta.mail.{Message, Session, Store}
 import org.eclipse.angus.mail.imap.{IMAPFolder, SortTerm}
-import zio.ZIO.attempt
+import si.ogrodje.ashhook.config.MailServerConfig
+import zio.ZIO.{attempt, executor, fromTry, logInfo}
 import zio.stream.{Stream, ZStream}
 import zio.{Chunk, RIO, Scope, Task, ZIO}
+import zio.durationInt
 
 final case class MessageID(
   uid: Option[Long],        // IMAP UID
@@ -22,21 +24,21 @@ final case class EmailMessage(
 )
 
 object EmailStream:
+  import JakartaOps.{*, given}
   import FlagOps.*
+
   private def setupSSL: Task[Unit]         = attempt(TrustAllX509TrustManager.trustAllCertificates())
   private def createSession: Task[Session] = attempt(Session.getInstance(System.getProperties, null))
 
-  private def connectStore(config: SMTPConfig, session: Session): RIO[Scope, Store] = ZIO.fromAutoCloseable(attempt:
-    val store = session.getStore("imaps")
-    store.connect(config.host, config.port, config.username, config.password)
-    store
-  )
+  private def connectStore(config: MailServerConfig, session: Session): RIO[Scope, Store] =
+    ZIO.fromAutoCloseable(fromTry:
+      session.tryGetStore(config.protocol).flatMap(_.tryConnect(config))
+    )
 
-  private def openInbox(config: SMTPConfig, store: Store): RIO[Scope, IMAPFolder] = ZIO.fromAutoCloseable(attempt:
-    val inbox = store.getFolder("INBOX").asInstanceOf[IMAPFolder]
-    inbox.open(config.folderMode)
-    inbox
-  )
+  private def openFolder(config: MailServerConfig, store: Store, name: String = "INBOX"): RIO[Scope, IMAPFolder] =
+    ZIO.fromAutoCloseable(fromTry:
+      store.tryGetFolder(name).flatMap(_.tryOpenIt(config.folderMode))
+    )
 
   private def getMessageID(folder: IMAPFolder, message: Message): Task[MessageID] = attempt:
     MessageID(
@@ -55,15 +57,19 @@ object EmailStream:
                    )
   yield emailMessage
 
-  private def fetchExisting(config: SMTPConfig, folder: IMAPFolder, top: Int = 100): Stream[Throwable, EmailMessage] =
+  private def existingStream(
+    config: MailServerConfig,
+    folder: IMAPFolder,
+    top: Int = 100
+  ): Stream[Throwable, EmailMessage] =
     ZStream
-      .fromZIO(attempt(folder.getSortedMessages(Array(SortTerm.REVERSE, SortTerm.DATE))))
+      .fromZIO(fromTry(folder.tryGetSortedMessages(SortTerm.REVERSE, SortTerm.DATE)))
       .take(top)
       .flatMap(ZStream.fromIterable)
       .mapZIO(parseEmailMessage(folder))
 
-  private def observeForNew(config: SMTPConfig, folder: IMAPFolder): Stream[Throwable, EmailMessage] =
-    ZStream.logInfo("Starting monitoring of new messages") *>
+  private def monitoringStream(config: MailServerConfig, folder: IMAPFolder): Stream[Throwable, EmailMessage] =
+    ZStream.logInfo(s"Starting monitoring of ${folder.getName} for new messages") *>
       ZStream.asyncZIO[Any, Throwable, EmailMessage]: callback =>
         val listener = new MessageCountListener:
           def messagesRemoved(event: MessageCountEvent): Unit = ()
@@ -72,27 +78,40 @@ object EmailStream:
 
         folder.addMessageCountListener(listener)
 
-        // TODO: Could this be attemptBlocking without fork?
-        attempt {
+        ZIO.attemptBlocking {
           var supportsIdle = false
           try
-            folder.idle(); supportsIdle = true
-          finally supportsIdle = false
+            folder.idle() // Attempt to enter IDLE mode
+            supportsIdle = true
+          catch
+            case _: Exception => supportsIdle = false // Fallback to polling if IDLE isn't supported
 
-          while true do
-            if supportsIdle then folder.idle()
-            else
-              Thread.sleep(200L); folder.getMessageCount
+            // Fallback to interval pooling with 200ms delay
+          if supportsIdle then folder.idle()
+          else (ZIO.attemptBlocking(folder.getMessageCount) *> ZIO.sleep(200.millis)).forever.fork
         }.fork
 
-  def make(config: SMTPConfig, top: Int = 100): ZStream[Scope, Throwable, EmailMessage] = ZStream.acquireReleaseWith {
+  def observe(config: MailServerConfig): ZStream[Scope, Throwable, MailMessage] = ZStream.scoped {
     for
       _       <- setupSSL
       session <- createSession
       store   <- connectStore(config, session)
-      inbox   <- openInbox(config, store)
-    yield store -> inbox
-  }(_ => ZIO.none).flatMap((store, inbox) =>
-    fetchExisting(config, inbox, top) ++
-      observeForNew(config, inbox)
-  )
+      inbox   <- openFolder(config, store)
+    yield monitoringStream(config, inbox).map(MailMessage.Fresh(_))
+  }.flatten
+
+  def streamAll(config: MailServerConfig, top: Int = 100): ZStream[Scope, Throwable, MailMessage] = ZStream.scoped {
+    for
+      _       <- setupSSL
+      session <- createSession
+      store   <- connectStore(config, session)
+      inbox   <- openFolder(config, store)
+    yield
+      val existing   = existingStream(config, inbox, top).map(MailMessage.Existing(_))
+      val monitoring = monitoringStream(config, inbox).map(MailMessage.Fresh(_))
+      existing ++ monitoring
+  }.flatten
+
+enum MailMessage(val message: EmailMessage):
+  case Existing(override val message: EmailMessage) extends MailMessage(message)
+  case Fresh(override val message: EmailMessage)    extends MailMessage(message)

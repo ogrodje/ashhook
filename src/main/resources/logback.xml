@@ -17,6 +17,7 @@
 
     <logger name="si.ogrodje.ashhook" level="INFO"/>
     <logger name="jakarta.mail" level="DEBUG"/>
+    <logger name="zio.http" level="DEBUG"/>
 
     <root level="${APP_LOG_LEVEL:-WARN}">
         <appender-ref ref="STDOUT"/>

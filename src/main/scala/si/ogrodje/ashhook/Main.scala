@@ -6,25 +6,40 @@ import zio.ZIO.logInfo
 import zio.{Runtime, Scope, ZIO, ZIOAppArgs, ZIOAppDefault, ZLayer}
 import eu.timepit.refined.auto.autoUnwrap
 import zio.logging.backend.SLF4J
+import MailMessage.*
+import si.ogrodje.ashhook.config.{AppConfig, MailServerConfig}
+import zio.stream.{ZSink, ZStream}
+import zio.http.{Body, Client, MediaType}
+import zio.json.*
 
+import java.io.IOException
+import java.nio.charset.{Charset, StandardCharsets}
 import javax.net.ssl.{SSLContext, X509TrustManager}
 
 object Main extends ZIOAppDefault:
   override val bootstrap: ZLayer[ZIOAppArgs, Nothing, Any] = Runtime.removeDefaultLoggers >>> SLF4J.slf4j
 
   private def program = for
-    config <- ZIO.service[SMTPConfig]
-    _      <- logInfo("This is main")
-    _      <- logInfo(s"Config: ${config}")
-    // _      <- SMTPMailFetcher.run(config)
-    _      <- EmailStream
-                .make(config)
-                .tap(m =>
-                  logInfo(
-                    s"✉️ [${m.flags.mkString(", ")}][${m.messageID}] ${m.subject} from ${m.from}"
-                  )
-                )
-                .runDrain
+    appConfig     <- ZIO.service[AppConfig]
+    _             <- logInfo("This is main")
+    _             <- logInfo(s"Config: ${appConfig}")
+    mailStreamFib <-
+      EmailStream
+        .observe(appConfig.mailServerConfig)
+        .tap {
+          case Existing(message) =>
+            logInfo(
+              s"✉️ [${message.flags.mkString(", ")}][${message.messageID}] ${message.subject} from ${message.from}"
+            )
+          case Fresh(message)    =>
+            logInfo(
+              s"✨ [${message.flags.mkString(", ")}][${message.messageID}] ${message.subject} from ${message.from}"
+            )
+        }
+        .run(WebhookForwarder.sink) // Actually emits.
+        // .runDrain
+        .fork
+    _             <- mailStreamFib.join
   yield ()
 
-  override def run = program.provide(SMTPConfig.live.and(Scope.default))
+  override def run = program.provide(Client.default, AppConfig.live.and(Scope.default))

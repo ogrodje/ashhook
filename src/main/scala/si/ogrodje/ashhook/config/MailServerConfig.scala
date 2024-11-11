@@ -1,4 +1,5 @@
-package si.ogrodje.ashhook
+package si.ogrodje.ashhook.config
+
 import eu.timepit.refined.*
 import eu.timepit.refined.api.{Refined, RefinedTypeOps}
 import eu.timepit.refined.auto.autoUnwrap
@@ -6,27 +7,36 @@ import eu.timepit.refined.boolean.*
 import eu.timepit.refined.collection.*
 import eu.timepit.refined.numeric.*
 import eu.timepit.refined.string.*
-import si.ogrodje.ashhook.SMTPConfig.*
-import zio.{RIO, ZIO, ZLayer}
 import jakarta.mail.Folder
+import si.ogrodje.ashhook.config.MailServerConfig.*
+import si.ogrodje.ashhook.config.Protocol.IMAPS
+import si.ogrodje.ashhook.config.{MailServerConfigError, Protocol}
+import zio.{RIO, ZIO, ZLayer}
+
 import scala.util.control.NoStackTrace
 
-final case class SMTPConfig private (
+enum Protocol(val name: String):
+  case IMAP  extends Protocol("imap")
+  case IMAPS extends Protocol("imaps")
+
+final case class MailServerConfig private (
   host: Host,
   username: Username,
   password: Password,
   port: Port,
+  protocol: Protocol = IMAPS,
   markAsSeen: Boolean = false
 ):
   def folderMode: Int           = if markAsSeen then Folder.READ_WRITE else Folder.READ_ONLY
-  override def toString: String = s"SMTPConfig($host, $username, ${password.value.take(4)}..., ${port})"
+  override def toString: String =
+    s"MailServerConfig($host, $username, ${password.value.take(4)}..., ${protocol}, ${port})"
 
-enum SMTPConfigError(message: String) extends RuntimeException(message) with NoStackTrace:
-  case ValidationError(message: String)      extends SMTPConfigError(message)
-  case EnvironmentReadingError(name: String) extends SMTPConfigError(s"Failed reading environment variable $name")
+enum MailServerConfigError(message: String) extends RuntimeException(message) with NoStackTrace:
+  case ValidationError(message: String)      extends MailServerConfigError(message)
+  case EnvironmentReadingError(name: String) extends MailServerConfigError(s"Failed reading environment variable $name")
 
-object SMTPConfig:
-  import SMTPConfigError.*
+object MailServerConfig:
+  import MailServerConfigError.*
 
   private type Host     = String Refined NonEmpty
   private type Username = String Refined NonEmpty
@@ -38,7 +48,7 @@ object SMTPConfig:
     rawUsername: String,
     rawPassword: String,
     rawPort: String
-  ): Either[String, SMTPConfig] = for
+  ): Either[String, MailServerConfig] = for
     hostname <- refineV[NonEmpty](rawHostname)
     username <- refineV[NonEmpty](rawUsername)
     password <- refineV[NonEmpty](rawPassword)
@@ -55,18 +65,18 @@ object SMTPConfig:
     username: String,
     password: String,
     port: String
-  ): ZIO[Any, ValidationError, SMTPConfig] =
+  ): ZIO[Any, ValidationError, MailServerConfig] =
     ZIO.fromEither(load(hostname, username, password, port)).mapError(ValidationError.apply)
 
   private def readRequiredEnv(key: String): ZIO[Any, EnvironmentReadingError, String] =
     zio.System.env(key).flatMap(ZIO.fromOption(_)).orElseFail(EnvironmentReadingError(key))
 
-  private def fromEnvironment: ZIO[Any, SMTPConfigError, SMTPConfig] = for
-    hostname <- readRequiredEnv("SMTP_HOSTNAME")
-    username <- readRequiredEnv("SMTP_USERNAME")
-    password <- readRequiredEnv("SMTP_PASSWORD")
-    port     <- readRequiredEnv("SMTP_PORT")
+  def fromEnvironment: ZIO[Any, MailServerConfigError, MailServerConfig] = for
+    hostname <- readRequiredEnv("IMAP_HOSTNAME")
+    username <- readRequiredEnv("IMAP_USERNAME")
+    password <- readRequiredEnv("IMAP_PASSWORD")
+    port     <- readRequiredEnv("IMAP_PORT")
     config   <- loadZIO(hostname, username, password, port)
   yield config
 
-  def live: ZLayer[Any, Throwable, SMTPConfig] = ZLayer.fromZIO(fromEnvironment)
+  def live: ZLayer[Any, Throwable, MailServerConfig] = ZLayer.fromZIO(fromEnvironment)
