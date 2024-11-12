@@ -13,7 +13,10 @@ import zio.durationInt
 final case class MessageID(
   uid: Option[Long],        // IMAP UID
   messageID: Option[String] // RFC 822 - Message ID Header
-)
+):
+  def asString: String = messageID
+    .map(i => s"mid::${i}")
+    .getOrElse(uid.map(i => s"uid::${i}").getOrElse("NOID"))
 
 final case class EmailMessage(
   messageID: MessageID,
@@ -21,7 +24,10 @@ final case class EmailMessage(
   from: String,
   content: String,
   flags: Set[SafeFlags]
-)
+):
+
+  def asString: String =
+    s"[${flags.mkString(", ")}][${messageID.asString}] ${subject} from ${from}"
 
 object EmailStream:
   import JakartaOps.{*, given}
@@ -100,7 +106,7 @@ object EmailStream:
     yield monitoringStream(config, inbox).map(MailMessage.Fresh(_))
   }.flatten
 
-  def streamAll(config: MailServerConfig, top: Int = 100): ZStream[Scope, Throwable, MailMessage] = ZStream.scoped {
+  def streamAll(config: MailServerConfig, top: Int = 100): ZStream[Any, Throwable, MailMessage] = ZStream.scoped {
     for
       _       <- setupSSL
       session <- createSession

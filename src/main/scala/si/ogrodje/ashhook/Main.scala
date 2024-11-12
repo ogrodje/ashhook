@@ -27,14 +27,8 @@ object Main extends ZIOAppDefault:
       EmailStream
         .observe(appConfig.mailServerConfig)
         .tap {
-          case Existing(message) =>
-            logInfo(
-              s"✉️ [${message.flags.mkString(", ")}][${message.messageID}] ${message.subject} from ${message.from}"
-            )
-          case Fresh(message)    =>
-            logInfo(
-              s"✨ [${message.flags.mkString(", ")}][${message.messageID}] ${message.subject} from ${message.from}"
-            )
+          case Existing(message) => logInfo(s"✉️ ${message.asString}")
+          case Fresh(message)    => logInfo(s"✨ ${message.asString}")
         }
         .run(WebhookForwarder.sink) // Actually emits.
         // .runDrain
